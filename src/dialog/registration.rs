@@ -157,14 +157,14 @@ impl Registration {
     /// let registration = Registration::new(endpoint.inner.clone(), Some(credential));
     /// # }
     /// ```
-    pub fn new(endpoint: EndpointInnerRef, credential: Option<Credential>) -> Self {
+    pub fn new(endpoint: EndpointInnerRef, credential: Option<Credential>, public_address: Option<rsip::HostWithPort>) -> Self {
         Self {
             last_seq: 0,
             endpoint,
             credential,
             contact: None,
             allow: Default::default(),
-            public_address: None,
+            public_address,
         }
     }
 
