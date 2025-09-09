@@ -6,6 +6,7 @@ use crate::{
     },
     Result,
 };
+use encoding_rs::GBK;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
@@ -62,8 +63,31 @@ impl UdpConnection {
         Ok(t)
     }
 
+    fn decode_sip_message(&self, buf: &[u8]) -> Result<String> {
+        // 先尝试 UTF-8 解码
+        if let Ok(utf8_str) = std::str::from_utf8(buf) {
+            // 如果是 XML 且声明为 GB2312
+            if utf8_str.starts_with("<?xml") && utf8_str.contains("encoding=\"GB2312\"") {
+                let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
+                 if had_errors {
+                    return Err(crate::Error::Error("Invalid encoding".into()));
+                }
+                return Ok(decoded.into_owned());
+            }
+            return Ok(utf8_str.to_string());
+        }
+
+        // 否则尝试 GB2312 解码
+        let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
+        if had_errors {
+             return Err(crate::Error::Error("Invalid encoding".into()));
+        }
+        Ok(decoded.into_owned())
+    }
+
     pub async fn serve_loop(&self, sender: TransportSender) -> Result<()> {
-        let mut buf = vec![0u8; 2048];
+        //let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 65536];
         loop {
             let (len, addr) = tokio::select! {
                 // Check for cancellation on each iteration
@@ -103,20 +127,29 @@ impl UdpConnection {
                 }
             }
 
-            let undecoded = match std::str::from_utf8(&buf[..len]) {
+            // let undecoded = match std::str::from_utf8(&buf[..len]) {
+            //     Ok(s) => s,
+            //     Err(e) => {
+            //         info!(
+            //             "decoding text from: {} error: {} buf: {:?}",
+            //             addr,
+            //             e,
+            //             &buf[..len]
+            //         );
+            //         continue;
+            //     }
+            // };
+
+            let undecoded = match self.decode_sip_message(&buf[..len]) {
                 Ok(s) => s,
                 Err(e) => {
-                    info!(
-                        "decoding text from: {} error: {} buf: {:?}",
-                        addr,
-                        e,
-                        &buf[..len]
-                    );
+                    println!("1111111111111111111");
+                    info!("decoding text from: {} error: {} buf: {:?}", addr, e, &buf[..len]);
                     continue;
                 }
             };
 
-            let msg = match rsip::SipMessage::try_from(undecoded) {
+            let msg = match rsip::SipMessage::try_from(undecoded.clone()) {
                 Ok(msg) => msg,
                 Err(e) => {
                     info!(
