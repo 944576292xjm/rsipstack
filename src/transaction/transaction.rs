@@ -250,6 +250,7 @@ impl Transaction {
                 Some(addr) => addr,
                 None => &SipAddr::try_from(&self.original.uri)?,
             };
+
             let (connection, resolved_addr) = self
                 .endpoint_inner
                 .transport_layer
