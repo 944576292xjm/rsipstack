@@ -7,6 +7,7 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use rsip::SipMessage;
+use encoding_rs::GBK;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::Mutex,
@@ -47,10 +48,36 @@ impl std::fmt::Display for SipCodecType {
     }
 }
 
+impl SipCodec {
+    fn decode_sip_message(&self, buf: &[u8]) -> Result<String> {
+        // 先尝试 UTF-8 解码
+        if let Ok(utf8_str) = std::str::from_utf8(buf) {
+            // 如果是 XML 且声明为 GB2312 或 GB18030
+            if utf8_str.starts_with("<?xml") && (
+                utf8_str.contains("encoding=\"GB2312\"") || 
+                utf8_str.contains("encoding=\"GB18030\"")
+            ) {
+                let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
+                if had_errors {
+                    return Err(crate::Error::Error("Invalid encoding".into()));
+                }
+                return Ok(decoded.into_owned());
+            }
+            return Ok(utf8_str.to_string());
+        }
+
+        // 否则尝试 GBK 解码 (兼容 GB2312 和 GB18030)
+        let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
+        if had_errors {
+            return Err(crate::Error::Error("Invalid encoding".into()));
+        }
+        Ok(decoded.into_owned())
+    }
+}
+
 impl Decoder for SipCodec {
     type Item = SipCodecType;
     type Error = crate::Error;
-
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         if src.len() >= 4 && &src[0..4] == KEEPALIVE_REQUEST {
             src.advance(4);
@@ -68,7 +95,19 @@ impl Decoder for SipCodec {
         {
             let msg_end = end_pos + KEEPALIVE_REQUEST.len();
             let msg_data = &src[..msg_end];
-            match SipMessage::try_from(msg_data) {
+
+            let undecoded = match self.decode_sip_message(msg_data) {
+                Ok(s) => s,
+                Err(e) => {
+                    info!("decoding text  error: {} buf: {:?}", e, msg_data);
+                    src.advance(msg_end);
+                    //println!("1111111111111111111");
+                   
+                    return Err(e);
+                }
+            };
+
+            match SipMessage::try_from(undecoded) {
                 Ok(msg) => {
                     src.advance(msg_end);
                     Ok(Some(SipCodecType::Message(msg)))
