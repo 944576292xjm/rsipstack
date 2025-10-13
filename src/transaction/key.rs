@@ -89,7 +89,8 @@ impl TransactionKey {
                     role, method, cseq, call_id, from_tag, via.uri.host_with_port
                 )
             }
-        }?;
+        }
+        .map_err(|e| Error::Error(e.to_string()))?;
         Ok(TransactionKey(key))
     }
 }

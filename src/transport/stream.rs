@@ -7,7 +7,6 @@ use crate::{
 };
 use bytes::{Buf, BytesMut};
 use rsip::SipMessage;
-use encoding_rs::GBK;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::Mutex,
@@ -16,6 +15,8 @@ use tokio_util::codec::{Decoder, Encoder};
 use tracing::{debug, info, warn};
 
 pub(super) const MAX_SIP_MESSAGE_SIZE: usize = 65535;
+const CL_FULL_NAME: &[u8] = b"content-length";
+const CL_SHORT_NAME: &[u8] = b"l";
 
 pub struct SipCodec {}
 
@@ -48,36 +49,10 @@ impl std::fmt::Display for SipCodecType {
     }
 }
 
-impl SipCodec {
-    fn decode_sip_message(&self, buf: &[u8]) -> Result<String> {
-        // 先尝试 UTF-8 解码
-        if let Ok(utf8_str) = std::str::from_utf8(buf) {
-            // 如果是 XML 且声明为 GB2312 或 GB18030
-            if utf8_str.starts_with("<?xml") && (
-                utf8_str.contains("encoding=\"GB2312\"") || 
-                utf8_str.contains("encoding=\"GB18030\"")
-            ) {
-                let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
-                if had_errors {
-                    return Err(crate::Error::Error("Invalid encoding".into()));
-                }
-                return Ok(decoded.into_owned());
-            }
-            return Ok(utf8_str.to_string());
-        }
-
-        // 否则尝试 GBK 解码 (兼容 GB2312 和 GB18030)
-        let (decoded, had_errors) = GBK.decode_without_bom_handling(buf);
-        if had_errors {
-            return Err(crate::Error::Error("Invalid encoding".into()));
-        }
-        Ok(decoded.into_owned())
-    }
-}
-
 impl Decoder for SipCodec {
     type Item = SipCodecType;
     type Error = crate::Error;
+
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         if src.len() >= 4 && &src[0..4] == KEEPALIVE_REQUEST {
             src.advance(4);
@@ -89,43 +64,74 @@ impl Decoder for SipCodec {
             return Ok(Some(SipCodecType::KeepaliveResponse));
         }
 
-        if let Some(end_pos) = src
-            .windows(KEEPALIVE_REQUEST.len())
-            .position(|window| window == KEEPALIVE_REQUEST)
-        {
-            let msg_end = end_pos + KEEPALIVE_REQUEST.len();
-            let msg_data = &src[..msg_end];
+        if let Some(headers_end) = src.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = &src[..headers_end + 4]; // include CRLFCRLF
 
-            let undecoded = match self.decode_sip_message(msg_data) {
-                Ok(s) => s,
-                Err(e) => {
-                    info!("decoding text  error: {} buf: {:?}", e, msg_data);
-                    src.advance(msg_end);
-                    //println!("1111111111111111111");
-                   
-                    return Err(e);
+            // Parse Content-Length as u32 without UTF-8 conversion
+            let mut content_length: usize = 0;
+            let mut start = 0;
+            while start < headers.len() {
+                // find end of line
+                let mut end = start;
+                while end < headers.len() && headers[end] != b'\n' {
+                    end += 1;
                 }
-            };
 
-            match SipMessage::try_from(undecoded) {
-                Ok(msg) => {
-                    src.advance(msg_end);
-                    Ok(Some(SipCodecType::Message(msg)))
+                let mut line = &headers[start..end];
+                if let Some(&b'\r') = line.last() {
+                    line = &line[..line.len().saturating_sub(1)];
                 }
-                Err(e) => {
-                    src.advance(msg_end);
-                    Err(crate::Error::Error(format!(
-                        "Failed to parse SIP message: {}",
-                        e
-                    )))
+
+                if let Some(colon) = line.iter().position(|&b| b == b':') {
+                    let header = &line[..colon];
+                    let is_cl = if header.len() == CL_FULL_NAME.len()
+                        && header
+                            .iter()
+                            .zip(CL_FULL_NAME.iter())
+                            .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+                    {
+                        true
+                    } else if header.len() == CL_SHORT_NAME.len()
+                        && header
+                            .iter()
+                            .zip(CL_SHORT_NAME.iter())
+                            .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+                    {
+                        true
+                    } else {
+                        false
+                    };
+
+                    if is_cl {
+                        // parse value
+                        let value_buf = &line[colon + 1..];
+                        content_length = std::str::from_utf8(value_buf)
+                            .map_err(|_| crate::Error::Error("Invalid Content-Length".to_string()))?
+                            .trim()
+                            .parse()
+                            .map_err(|_| {
+                                crate::Error::Error("Invalid Content-Length value".to_string())
+                            })?;
+                        break;
+                    }
                 }
+
+                start = if end < headers.len() { end + 1 } else { end };
             }
-        } else {
-            if src.len() > MAX_SIP_MESSAGE_SIZE {
-                return Err(crate::Error::Error("SIP message too large".to_string()));
+
+            let total_len = headers_end + 4 + content_length;
+
+            if src.len() >= total_len {
+                let msg_data = src.split_to(total_len); // consume full message
+                let msg = SipMessage::try_from(&msg_data[..])?;
+                return Ok(Some(SipCodecType::Message(msg)));
             }
-            Ok(None)
         }
+
+        if src.len() > MAX_SIP_MESSAGE_SIZE {
+            return Err(crate::Error::Error("SIP message too large".to_string()));
+        }
+        Ok(None)
     }
 }
 
@@ -202,8 +208,8 @@ where
                     buffer.extend_from_slice(&read_buf[0..n]);
 
                     loop {
-                        match codec.decode(&mut buffer) {
-                            Ok(Some(msg)) => match msg {
+                        match codec.decode(&mut buffer)? {
+                            Some(msg) => match msg {
                                 SipCodecType::Message(sip_msg) => {
                                     debug!("Received message from {}: {}", remote_addr, sip_msg);
                                     let remote_socket_addr = remote_addr.get_socketaddr()?;
@@ -227,13 +233,9 @@ where
                                 }
                                 SipCodecType::KeepaliveResponse => {}
                             },
-                            Ok(None) => {
+                            None => {
                                 // Need more data
                                 break;
-                            }
-                            Err(e) => {
-                                warn!("Error decoding message from {}: {:?}", remote_addr, e);
-                                // Continue processing despite decode errors
                             }
                         }
                     }
@@ -249,7 +251,10 @@ where
 
     pub async fn close(&self) -> Result<()> {
         let mut write_half = self.write_half.lock().await;
-        write_half.shutdown().await?;
+        write_half
+            .shutdown()
+            .await
+            .map_err(|e| crate::Error::Error(format!("Failed to shutdown write half: {}", e)))?;
         Ok(())
     }
 }

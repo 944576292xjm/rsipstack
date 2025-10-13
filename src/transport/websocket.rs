@@ -59,7 +59,7 @@ impl WebSocketListenerConnection {
         let inner = WebSocketListenerConnectionInner {
             local_addr,
             external: external.map(|addr| SipAddr {
-                r#type: Some(transport_type.clone()),
+                r#type: Some(transport_type),
                 addr: addr.into(),
             }),
             is_secure,
@@ -94,7 +94,7 @@ impl WebSocketListenerConnection {
                 debug!("New WebSocket connection from {}", remote_addr);
 
                 let remote_addr = SipAddr {
-                    r#type: Some(transport_type.clone()),
+                    r#type: Some(transport_type),
                     addr: remote_addr.into(),
                 };
                 let transport_layer_inner_ref = transport_layer_inner.clone();

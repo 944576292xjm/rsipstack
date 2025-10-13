@@ -2,13 +2,14 @@ use super::endpoint::EndpointInnerRef;
 use super::key::TransactionKey;
 use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
 use crate::dialog::DialogId;
+use crate::rsip_ext::destination_from_request;
 use crate::transaction::make_tag;
 use crate::transport::SipAddr;
 use crate::{Error, Result};
 use rsip::headers::ContentLength;
 use rsip::message::HasHeaders;
 use rsip::prelude::HeadersExt;
-use rsip::{Header, Method, Request, Response, SipMessage, StatusCode};
+use rsip::{Header, Method, Request, Response, SipMessage, StatusCode, StatusCodeKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, trace};
 
@@ -161,6 +162,7 @@ pub struct Transaction {
     pub tu_sender: TransactionEventSender,
     pub timer_a: Option<u64>,
     pub timer_b: Option<u64>,
+    pub timer_c: Option<u64>,
     pub timer_d: Option<u64>,
     pub timer_k: Option<u64>, // server invite only
     pub timer_g: Option<u64>, // server invite only
@@ -184,7 +186,7 @@ impl Transaction {
         } else {
             TransactionState::Nothing
         };
-        info!(%key, %state, "transaction created");
+        trace!(%key, %state, "transaction created");
         let tx = Self {
             transaction_type,
             endpoint_inner,
@@ -197,6 +199,7 @@ impl Transaction {
             last_ack: None,
             timer_a: None,
             timer_b: None,
+            timer_c: None,
             timer_d: None,
             timer_k: None,
             timer_g: None,
@@ -250,7 +253,6 @@ impl Transaction {
                 Some(addr) => addr,
                 None => &SipAddr::try_from(&self.original.uri)?,
             };
-
             let (connection, resolved_addr) = self
                 .endpoint_inner
                 .transport_layer
@@ -377,13 +379,13 @@ impl Transaction {
             | (&TransactionState::Completed, &TransactionState::Terminated)
             | (&TransactionState::Confirmed, &TransactionState::Terminated) => Ok(()),
             _ => {
-                return Err(Error::TransactionError(
+                Err(Error::TransactionError(
                     format!(
                         "invalid state transition from {} to {}",
                         self.state, target
                     ),
                     self.key.clone(),
-                ));
+                ))
             }
         }
     }
@@ -408,16 +410,14 @@ impl Transaction {
                 }
                 self.transition(TransactionState::Completed).map(|_| ())
             }
-            _ => {
-                return Err(Error::TransactionError(
-                    format!("invalid state for sending CANCEL {:?}", self.state),
-                    self.key.clone(),
-                ));
-            }
+            _ => Err(Error::TransactionError(
+                format!("invalid state for sending CANCEL {:?}", self.state),
+                self.key.clone(),
+            )),
         }
     }
 
-    async fn send_ack(&mut self, connection: Option<SipConnection>) -> Result<()> {
+    pub async fn send_ack(&mut self, connection: Option<SipConnection>) -> Result<()> {
         if self.transaction_type != TransactionType::ClientInvite {
             return Err(Error::TransactionError(
                 "send_ack is only valid for client invite transactions".to_string(),
@@ -454,6 +454,11 @@ impl Transaction {
         } else {
             ack.to_owned().into()
         };
+        if let SipMessage::Request(ref req) = ack {
+            if let Some(destination) = destination_from_request(req) {
+                self.destination = Some(destination);
+            }
+        }
         match ack.clone() {
             SipMessage::Request(ack) => self.last_ack.replace(ack),
             _ => None,
@@ -598,7 +603,7 @@ impl Transaction {
             _ => {}
         }
         let new_state = match resp.status_code.kind() {
-            rsip::StatusCodeKind::Provisional => {
+            StatusCodeKind::Provisional => {
                 if resp.status_code == rsip::StatusCode::Trying {
                     TransactionState::Trying
                 } else {
@@ -623,7 +628,7 @@ impl Transaction {
         self.last_response.replace(resp.clone());
         self.transition(new_state).ok();
         self.send_ack(connection).await.ok(); // send ACK for client invite
-        return Some(SipMessage::Response(resp));
+        Some(SipMessage::Response(resp))
     }
 
     async fn on_timer(&mut self, timer: TransactionTimer) -> Result<()> {
@@ -654,18 +659,18 @@ impl Transaction {
                             .timeout(duration, TransactionTimer::TimerA(key, duration));
                         self.timer_a.replace(timer_a);
                     } else if let TransactionTimer::TimerB(_) = timer {
-                        // Inform TU about timeout
                         let timeout_response = self.endpoint_inner.make_response(
                             &self.original,
                             rsip::StatusCode::RequestTimeout,
                             None,
                         );
                         self.inform_tu_response(timeout_response)?;
+                        self.transition(TransactionState::Terminated)?;
                     }
                 }
             }
             TransactionState::Proceeding => {
-                if let TransactionTimer::TimerB(_) = timer {
+                if let TransactionTimer::TimerC(_) = timer {
                     // Inform TU about timeout
                     let timeout_response = self.endpoint_inner.make_response(
                         &self.original,
@@ -673,6 +678,7 @@ impl Transaction {
                         None,
                     );
                     self.inform_tu_response(timeout_response)?;
+                    self.transition(TransactionState::Terminated)?;
                 }
             }
             TransactionState::Completed => {
@@ -741,7 +747,7 @@ impl Transaction {
                         self.timer_a.replace(timer_a);
                     }
                     self.timer_b.replace(self.endpoint_inner.timers.timeout(
-                        self.endpoint_inner.option.timerb,
+                        self.endpoint_inner.option.t1x64,
                         TransactionTimer::TimerB(self.key.clone()),
                     ));
                 }
@@ -750,17 +756,18 @@ impl Transaction {
                 self.timer_a
                     .take()
                     .map(|id| self.endpoint_inner.timers.cancel(id));
-
-                if matches!(
-                    self.transaction_type,
-                    TransactionType::ClientInvite | TransactionType::ClientNonInvite
-                ) && self.timer_b.is_none()
-                {
-                    let timer_b = self.endpoint_inner.timers.timeout(
-                        self.endpoint_inner.option.timerb,
-                        TransactionTimer::TimerB(self.key.clone()),
-                    );
-                    self.timer_b.replace(timer_b);
+                if matches!(self.transaction_type, TransactionType::ClientInvite) {
+                    self.timer_b
+                        .take()
+                        .map(|id| self.endpoint_inner.timers.cancel(id));
+                    if self.timer_c.is_none() {
+                        // start Timer C for client invite only
+                        let timer_c = self.endpoint_inner.timers.timeout(
+                            self.endpoint_inner.option.timerc,
+                            TransactionTimer::TimerC(self.key.clone()),
+                        );
+                        self.timer_c.replace(timer_c);
+                    }
                 }
             }
             TransactionState::Completed => {
@@ -768,6 +775,9 @@ impl Transaction {
                     .take()
                     .map(|id| self.endpoint_inner.timers.cancel(id));
                 self.timer_b
+                    .take()
+                    .map(|id| self.endpoint_inner.timers.cancel(id));
+                self.timer_c
                     .take()
                     .map(|id| self.endpoint_inner.timers.cancel(id));
 
@@ -795,7 +805,7 @@ impl Transaction {
                                 .waiting_ack
                                 .write()
                                 .as_mut()
-                                .and_then(|wa| Ok(wa.insert(dialog_id, self.key.clone())))
+                                .map(|wa| wa.insert(dialog_id, self.key.clone()))
                                 .ok();
                         }
                         _ => {}
@@ -842,6 +852,9 @@ impl Transaction {
         self.timer_b
             .take()
             .map(|id| self.endpoint_inner.timers.cancel(id));
+        self.timer_c
+            .take()
+            .map(|id| self.endpoint_inner.timers.cancel(id));
         self.timer_d
             .take()
             .map(|id| self.endpoint_inner.timers.cancel(id));
@@ -877,10 +890,27 @@ impl Transaction {
         let last_message = {
             match self.transaction_type {
                 TransactionType::ClientInvite => {
-                    self.last_ack.take().map(|r| SipMessage::Request(r))
+                    //
+                    // For client invite, make a placeholder ACK if in proceeding or trying state
+                    if matches!(
+                        self.state,
+                        TransactionState::Proceeding | TransactionState::Trying
+                    ) {
+                        if self.last_ack.is_none() {
+                            if let Some(ref resp) = self.last_response {
+                                if let Ok(ack) = self
+                                    .endpoint_inner
+                                    .make_ack(self.original.uri.clone(), resp)
+                                {
+                                    self.last_ack.replace(ack);
+                                }
+                            }
+                        }
+                    }
+                    self.last_ack.take().map(SipMessage::Request)
                 }
                 TransactionType::ServerNonInvite => {
-                    self.last_response.take().map(|r| SipMessage::Response(r))
+                    self.last_response.take().map(SipMessage::Response)
                 }
                 _ => None,
             }
@@ -893,6 +923,6 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         self.cleanup();
-        info!(key=%self.key, state=%self.state, "transaction dropped");
+        trace!(key=%self.key, state=%self.state, "transaction dropped");
     }
 }

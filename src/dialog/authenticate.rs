@@ -70,12 +70,11 @@ use rsip::{Header, Param, Response};
 /// let invite_option = InviteOption {
 ///     caller: rsip::Uri::try_from("sip:alice@example.com")?,
 ///     callee: rsip::Uri::try_from("sip:bob@example.com")?,
-///     destination: None,
 ///     content_type: Some("application/sdp".to_string()),
 ///     offer: Some(sdp_bytes),
 ///     contact: rsip::Uri::try_from("sip:alice@192.168.1.100:5060")?,
 ///     credential: Some(credential),
-///     headers: None,
+///     ..Default::default()
 /// };
 /// # Ok(())
 /// # }
@@ -194,10 +193,12 @@ pub async fn handle_client_authenticate(
     let header = match resp.www_authenticate_header() {
         Some(h) => Header::WwwAuthenticate(h.clone()),
         None => {
+            let code = resp.status_code.clone();
             let proxy_header = rsip::header_opt!(resp.headers().iter(), Header::ProxyAuthenticate);
             let proxy_header = proxy_header.ok_or(crate::Error::DialogError(
                 "missing proxy/www authenticate".to_string(),
                 DialogId::try_from(&tx.original)?,
+                code,
             ))?;
             Header::ProxyAuthenticate(proxy_header.clone())
         }

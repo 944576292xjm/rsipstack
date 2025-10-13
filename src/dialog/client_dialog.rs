@@ -1,7 +1,6 @@
 use super::dialog::DialogInnerRef;
 use super::DialogId;
 use crate::dialog::dialog::DialogInner;
-use crate::rsip_ext::RsipResponseExt;
 use crate::transaction::transaction::Transaction;
 use crate::Result;
 use crate::{
@@ -11,6 +10,7 @@ use crate::{
     },
     rsip_ext::extract_uri_from_contact,
 };
+use rsip::prelude::HasHeaders;
 use rsip::{
     headers::Route,
     prelude::{HeadersExt, ToTypedHeader, UntypedHeader},
@@ -108,6 +108,10 @@ impl ClientInviteDialog {
         self.inner.id.lock().unwrap().clone()
     }
 
+    pub fn state(&self) -> DialogState {
+        self.inner.state.lock().unwrap().clone()
+    }
+
     /// Get the cancellation token for this dialog
     ///
     /// Returns a reference to the CancellationToken that can be used to
@@ -196,13 +200,20 @@ impl ClientInviteDialog {
         }
         info!(id=%self.id(),"sending cancel request");
         let mut cancel_request = self.inner.initial_request.clone();
+        cancel_request
+            .headers_mut()
+            .retain(|h| !matches!(h, Header::ContentLength(_) | Header::ContentType(_)));
+
+        cancel_request
+            .to_header_mut()?
+            .mut_tag(self.id().to_tag.clone().into())?; // ensure to-tag has tag param
+
         cancel_request.method = rsip::Method::Cancel;
         cancel_request
             .cseq_header_mut()?
             .mut_seq(self.inner.get_local_seq())?
             .mut_method(rsip::Method::Cancel)?;
         cancel_request.body = vec![];
-        cancel_request.to_header_mut()?.mut_tag("".into())?;
         self.inner.do_request(cancel_request).await?;
         Ok(())
     }
@@ -420,6 +431,7 @@ impl ClientInviteDialog {
                     return Err(crate::Error::DialogError(
                         "invalid request".to_string(),
                         self.id(),
+                        rsip::StatusCode::MethodNotAllowed,
                     ));
                 }
             }
@@ -483,6 +495,10 @@ impl ClientInviteDialog {
                             continue;
                         }
                         StatusCode::Ringing | StatusCode::SessionProgress => {
+                            match resp.to_header()?.tag() {
+                                Ok(Some(tag)) => self.inner.update_remote_tag(tag.value())?,
+                                _ => {}
+                            }
                             self.inner.transition(DialogState::Early(self.id(), resp))?;
                             continue;
                         }
@@ -506,6 +522,7 @@ impl ClientInviteDialog {
                                 )
                                 .await?;
                                 tx.send().await?;
+                                self.inner.update_remote_tag("").ok();
                                 continue;
                             } else {
                                 info!(id=%self.id(),"received 407 response without auth option");
@@ -554,25 +571,21 @@ impl ClientInviteDialog {
                                     route_set.push(Route::from(record_route.value()));
                                 }
                             }
+                            route_set.reverse();
                             *self.inner.route_set.lock().unwrap() = route_set;
 
                             self.inner
-                                .transition(DialogState::Confirmed(dialog_id.clone()))?;
+                                .transition(DialogState::Confirmed(dialog_id.clone(), resp))?;
                             DialogInner::serve_keepalive_options(self.inner.clone());
-                            break;
                         }
                         _ => {
-                            let mut reason = format!("{}", resp.status_code);
-                            if let Some(reason_phrase) = resp.reason_phrase() {
-                                reason = format!("{};{}", reason, reason_phrase);
-                            }
                             self.inner.transition(DialogState::Terminated(
                                 self.id(),
-                                TerminatedReason::UasOther(Some(resp.status_code.clone())),
+                                TerminatedReason::UasOther(resp.status_code.clone()),
                             ))?;
-                            return Err(crate::Error::DialogError(reason, self.id()));
                         }
                     }
+                    break;
                 }
             }
         }

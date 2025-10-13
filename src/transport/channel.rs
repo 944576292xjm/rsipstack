@@ -47,7 +47,7 @@ impl ChannelConnection {
     }
 
     pub fn get_addr(&self) -> &SipAddr {
-        return &self.inner.addr;
+        &self.inner.addr
     }
 
     pub async fn serve_loop(&self, sender: TransportSender) -> Result<()> {

@@ -262,3 +262,69 @@ fn test_sip_codec_size_limit() {
     let result = codec.decode(&mut buffer);
     assert!(result.is_err(), "Should error on oversized message");
 }
+
+/// Test SipCodec handling of multiple messages in one buffer (TCP packet coalescing)
+#[test]
+fn test_sip_codec_multiple_messages_with_bodies() {
+    let mut codec = SipCodec::new();
+    let mut buffer = BytesMut::new();
+
+    let message1 = "REGISTER sip:example.com SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK-test1\r\n\
+                    From: <sip:alice@example.com>;tag=test1\r\n\
+                    To: <sip:alice@example.com>\r\n\
+                    Call-ID: test-call-id-1\r\n\
+                    CSeq: 1 REGISTER\r\n\
+                    Contact: <sip:alice@127.0.0.1:5060>\r\n\
+                    Max-Forwards: 70\r\n\
+                    Content-Length: 11\r\n\r\nHello world";
+
+    let message2 = "REGISTER sip:example.com SIP/2.0\r\n\
+                    Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK-test2\r\n\
+                    From: <sip:bob@example.com>;tag=test2\r\n\
+                    To: <sip:bob@example.com>\r\n\
+                    Call-ID: test-call-id-2\r\n\
+                    CSeq: 1 REGISTER\r\n\
+                    Contact: <sip:bob@127.0.0.1:5060>\r\n\
+                    Max-Forwards: 70\r\n\
+                    Content-Length: 6\r\n\r\nfoobar";
+
+    // Add both messages to buffer
+    buffer.extend_from_slice(message1.as_bytes());
+    buffer.extend_from_slice(message2.as_bytes());
+
+    // First decode
+    let result1 = codec
+        .decode(&mut buffer)
+        .expect("first decode should succeed");
+    assert!(result1.is_some(), "Should decode first message");
+
+    let msg1 = result1.unwrap();
+    match msg1 {
+        crate::transport::stream::SipCodecType::Message(SipMessage::Request(req)) => {
+            assert_eq!(req.call_id_header().unwrap().value(), "test-call-id-1");
+        }
+        _ => panic!("Expected request message"),
+    }
+
+    // Second decode
+    let result2 = codec
+        .decode(&mut buffer)
+        .expect("second decode should succeed");
+    assert!(result2.is_some(), "Should decode second message");
+
+    let msg2 = result2.unwrap();
+    match msg2 {
+        crate::transport::stream::SipCodecType::Message(SipMessage::Request(req)) => {
+            assert_eq!(req.call_id_header().unwrap().value(), "test-call-id-2");
+        }
+        _ => panic!("Expected request message"),
+    }
+
+    // Buffer should be empty after consuming both messages
+    assert_eq!(
+        buffer.len(),
+        0,
+        "Buffer should be empty after consuming all messages"
+    );
+}

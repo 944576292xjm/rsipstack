@@ -51,7 +51,7 @@ use tracing::{debug, info, trace, warn};
 /// dialog.accept(None, Some(answer_sdp))?;
 ///
 /// // Or reject the call
-/// dialog.reject()?;
+/// dialog.reject(None, None)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -98,6 +98,10 @@ impl ServerInviteDialog {
     /// The DialogId consists of Call-ID, from-tag, and to-tag.
     pub fn id(&self) -> DialogId {
         self.inner.id.lock().unwrap().clone()
+    }
+
+    pub fn state(&self) -> DialogState {
+        self.inner.state.lock().unwrap().clone()
     }
 
     /// Get the cancellation token for this dialog
@@ -277,7 +281,8 @@ impl ServerInviteDialog {
 
     /// Reject the incoming INVITE request
     ///
-    /// Sends a 603 Decline response to reject the incoming INVITE request.
+    /// Sends a reject response to reject the incoming INVITE request.
+    /// Sends a 603 Decline by default, or a custom status code if provided.
     /// This terminates the dialog creation process.
     ///
     /// # Returns
@@ -292,19 +297,24 @@ impl ServerInviteDialog {
     /// # fn example() -> rsipstack::Result<()> {
     /// # let dialog: ServerInviteDialog = todo!();
     /// // Reject the incoming call
-    /// dialog.reject()?;
+    /// dialog.reject(Some(rsip::StatusCode::BusyHere), Some("Busy here".into()))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn reject(&self) -> Result<()> {
+    pub fn reject(&self, code: Option<rsip::StatusCode>, reason: Option<String>) -> Result<()> {
         if self.inner.is_terminated() || self.inner.is_confirmed() {
             return Ok(());
         }
-        info!(id=%self.id(), "rejecting dialog");
+        info!(id=%self.id(), ?code, ?reason, "rejecting dialog");
+        let headers = if let Some(reason) = reason {
+            Some(vec![rsip::Header::Other("Reason".into(), reason.into())])
+        } else {
+            None
+        };
         let resp = self.inner.make_response(
             &self.inner.initial_request,
-            rsip::StatusCode::Decline,
-            None,
+            code.unwrap_or(rsip::StatusCode::Decline),
+            headers,
             None,
         );
         self.inner
@@ -587,6 +597,7 @@ impl ServerInviteDialog {
                     return Err(crate::Error::DialogError(
                         "invalid request in confirmed state".to_string(),
                         self.id(),
+                        rsip::StatusCode::MethodNotAllowed,
                     ));
                 }
                 rsip::Method::Bye => return self.handle_bye(tx).await,
@@ -599,6 +610,7 @@ impl ServerInviteDialog {
                     return Err(crate::Error::DialogError(
                         "invalid request".to_string(),
                         self.id(),
+                        rsip::StatusCode::MethodNotAllowed,
                     ));
                 }
             }
@@ -663,6 +675,10 @@ impl ServerInviteDialog {
                 match msg {
                     SipMessage::Request(req) => match req.method {
                         rsip::Method::Ack => {
+                            if self.inner.is_terminated() {
+                                // dialog already terminated, ignore
+                                break;
+                            }
                             info!(id = %self.id(),"received ack {}", req.uri);
                             match req.contact_header() {
                                 Ok(contact) => {
@@ -674,7 +690,11 @@ impl ServerInviteDialog {
                                 }
                                 _ => {}
                             }
-                            self.inner.transition(DialogState::Confirmed(self.id()))?;
+
+                            self.inner.transition(DialogState::Confirmed(
+                                self.id(),
+                                tx.last_response.clone().unwrap_or_default(),
+                            ))?;
                             DialogInner::serve_keepalive_options(self.inner.clone());
                             break;
                         }
@@ -715,6 +735,7 @@ impl TryFrom<&Dialog> for ServerInviteDialog {
             _ => Err(crate::Error::DialogError(
                 "Dialog is not a ServerInviteDialog".to_string(),
                 dlg.id(),
+                rsip::StatusCode::BadRequest,
             )),
         }
     }

@@ -88,10 +88,8 @@
 //!     callee: rsip::Uri::try_from("sip:bob@example.com")?,
 //!     contact: rsip::Uri::try_from("sip:alice@myhost.com:5060")?,
 //!     content_type: Some("application/sdp".to_string()),
-//!     destination: None,
 //!     offer: Some(sdp_body),
-//!     credential: None,
-//!     headers: None,
+//!     ..Default::default()
 //! };
 //!
 //! let (dialog, response) = dialog_layer.do_invite(invite_option, state_sender).await?;
@@ -135,13 +133,13 @@
 //! fn handle_sip_error(error: Error) {
 //!     match error {
 //!         Error::TransportLayerError(msg, addr) => {
-//!             eprintln!("Transport error at {}: {}", addr, msg);
+//!             eprintln!("Transport error at {msg}: {addr}");
 //!         },
 //!         Error::TransactionError(msg, key) => {
-//!             eprintln!("Transaction error {}: {}", key, msg);
+//!             eprintln!("Transaction error {msg}: {key}");
 //!         },
-//!         Error::DialogError(msg, id) => {
-//!             eprintln!("Dialog error {}: {}", id, msg);
+//!         Error::DialogError(msg, id, code) => {
+//!             eprintln!("Dialog error {msg}: {id} (Status code: {code})");
 //!         },
 //!         _ => eprintln!("Other error: {}", error),
 //!     }
@@ -240,4 +238,4 @@ pub mod transport;
 pub use transaction::EndpointBuilder;
 pub mod rsip_ext;
 
-const USER_AGENT: &str = concat!("rsipstack/", env!("CARGO_PKG_VERSION"));
+pub const VERSION: &str = concat!("rsipstack/", env!("CARGO_PKG_VERSION"));

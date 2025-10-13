@@ -1,9 +1,9 @@
+use crate::transport::{SipAddr, SipConnection};
+use crate::{Error, Result};
 use rsip::{
     message::HasHeaders,
     prelude::{HeadersExt, UntypedHeader},
 };
-
-use crate::transport::SipConnection;
 pub trait RsipResponseExt {
     fn reason_phrase(&self) -> Option<&str>;
     fn via_received(&self) -> Option<rsip::HostWithPort>;
@@ -20,7 +20,7 @@ impl RsipResponseExt for rsip::Response {
                 }
             }
             if let rsip::Header::ErrorInfo(reason) = header {
-                return Some(&reason.value());
+                return Some(reason.value());
             }
         }
         None
@@ -38,11 +38,8 @@ impl RsipResponseExt for rsip::Response {
     fn content_type(&self) -> Option<rsip::headers::ContentType> {
         let headers = self.headers();
         for header in headers.iter() {
-            match header {
-                rsip::Header::ContentType(content_type) => {
-                    return Some(content_type.clone());
-                }
-                _ => {}
+            if let rsip::Header::ContentType(content_type) = header {
+                return Some(content_type.clone());
             }
         }
         None
@@ -76,25 +73,35 @@ macro_rules! header_pop {
     };
 }
 
-pub fn extract_uri_from_contact(line: &str) -> crate::Result<rsip::Uri> {
-    match rsip::headers::Contact::try_from(line) {
-        Ok(contact) => {
-            match contact.uri() {
-                Ok(mut uri) => {
-                    uri.params
-                        .retain(|p| matches!(p, rsip::Param::Transport(_)));
-                    return Ok(uri);
-                }
-                Err(_) => {}
-            };
-        }
-        Err(_) => {}
-    };
+pub fn extract_uri_from_contact(line: &str) -> Result<rsip::Uri> {
+    if let Ok(mut uri) = rsip::headers::Contact::from(line).uri() {
+        uri.params
+            .retain(|p| matches!(p, rsip::Param::Transport(_)));
+        return Ok(uri);
+    }
 
     match line.split('<').nth(1).and_then(|s| s.split('>').next()) {
         Some(uri) => rsip::Uri::try_from(uri).map_err(Into::into),
-        None => Err(crate::Error::Error(format!("no uri found: {}", line))),
+        None => Err(Error::Error("no uri found".to_string())),
     }
+}
+
+pub fn destination_from_request(request: &rsip::Request) -> Option<SipAddr> {
+    request
+        .headers
+        .iter()
+        .find_map(|header| match header {
+            rsip::Header::Route(route) => {
+                let uri_str = route.value().to_string();
+                let trimmed = uri_str.trim();
+                let without_brackets = trimmed.trim_matches(['<', '>']);
+                rsip::Uri::try_from(without_brackets)
+                    .ok()
+                    .and_then(|uri| SipAddr::try_from(&uri).ok())
+            }
+            _ => None,
+        })
+        .or_else(|| SipAddr::try_from(&request.uri).ok())
 }
 
 #[test]

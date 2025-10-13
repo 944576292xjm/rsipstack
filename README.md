@@ -7,7 +7,7 @@ A RFC 3261 compliant SIP stack written in Rust. The goal of this project is to p
 ## Features
 
 - **RFC 3261 Compliant**: Full compliance with SIP specification
-- **Multiple Transport Support**: UDP, TCP, TLS, WebSocket
+- **Multiple Transport Support**: UDP, TCP, TLS, WebSocket (TLS/WebSocket require the `rustls` and `websocket` features, enabled by default)
 - **Transaction Layer**: Complete SIP transaction state machine
 - **Dialog Layer**: SIP dialog management
 - **Digest Authentication**: Built-in authentication support
@@ -70,80 +70,91 @@ cargo run --example client -- --port 25061 --sip-server 127.0.0.1:25060 --auto-a
 cargo run --example client -- --sip-server sip.example.com --user alice --password secret --auto-answer
 ```
 
-This example demonstrates:
-- SIP user registration with digest authentication
-- Making and receiving SIP calls (INVITE/BYE)
-- Dialog management for call sessions
-- RTP media streaming with file playback
-- STUN support for NAT traversal
-
-
 ## API Usage Guide
 
 ### 1. Simple SIP Connection
 
 ```rust
 use rsipstack::transport::{udp::UdpConnection, SipAddr};
+use tokio_util::sync::CancellationToken;
 
-// Create UDP connection
-let connection = UdpConnection::create_connection("127.0.0.1:5060".parse()?, None).await?;
+// Create UDP connection bound to an ephemeral local port
+let cancel_token = CancellationToken::new();
+let connection = UdpConnection::create_connection(
+    "0.0.0.0:0".parse()?,
+    None,
+    Some(cancel_token.child_token()),
+)
+.await?;
+
+// Prepare the remote target
+let target_addr = SipAddr::new(
+    rsip::transport::Transport::Udp,
+    rsip::HostWithPort::try_from("127.0.0.1:5060")?,
+);
 
 // Send raw SIP message
 let sip_message = "OPTIONS sip:test@example.com SIP/2.0\r\n...";
-connection.send_raw(sip_message.as_bytes(), &target_addr).await?;
+connection
+    .send_raw(sip_message.as_bytes(), &target_addr)
+    .await?;
 ```
 
-### 2. Using New Listener APIs
+### 2. Using Transport Listeners
 
 ```rust
 use rsipstack::transport::{
-    TcpListenerConnection, WebSocketListenerConnection, TlsListenerConnection,
-    TlsConfig, SipAddr
+    SipAddr, TcpListenerConnection, TransportEvent, TransportLayer,
 };
 use tokio_util::sync::CancellationToken;
-use tokio::sync::mpsc::unbounded_channel;
 
-// Create TCP listener
-let socket_addr: std::net::SocketAddr = "127.0.0.1:5060".parse()?;
-let local_addr = SipAddr::new(rsip::transport::Transport::Tcp, socket_addr.into());
-let tcp_listener = TcpListenerConnection::new(local_addr, None).await?;
-
+// Build a transport layer and register listeners
 let cancel_token = CancellationToken::new();
-let (sender, mut receiver) = unbounded_channel();
+let transport_layer = TransportLayer::new(cancel_token.clone());
 
-// Start TCP listener
-tcp_listener.serve_listener(cancel_token.clone(), sender.clone()).await?;
+let tcp_listener = TcpListenerConnection::new(
+    SipAddr::new(
+        rsip::transport::Transport::Tcp,
+        rsip::HostWithPort::try_from("0.0.0.0:5060")?,
+    ),
+    None,
+)
+.await?;
+transport_layer.add_transport(tcp_listener.into());
 
-// Create WebSocket listener
-let ws_local_addr = SipAddr::new(rsip::transport::Transport::Ws, socket_addr.into());
-let ws_listener = WebSocketListenerConnection::new(ws_local_addr, None, false).await?;
-ws_listener.serve_listener(cancel_token.clone(), sender.clone()).await?;
+// Access the transport event stream
+let mut events = transport_layer
+    .inner
+    .transport_rx
+    .lock()
+    .unwrap()
+    .take()
+    .expect("transport receiver");
 
-// Create TLS listener with configuration
-let tls_config = TlsConfig {
-    cert: Some(cert_pem_bytes),
-    key: Some(key_pem_bytes),
-    ..Default::default()
-};
-let tls_local_addr = SipAddr::new(rsip::transport::Transport::Tls, socket_addr.into());
-let tls_listener = TlsListenerConnection::new(tls_local_addr, None, tls_config).await?;
-tls_listener.serve_listener(cancel_token.clone(), sender.clone()).await?;
-
-// Handle incoming connections
-while let Some(event) = receiver.recv().await {
-    match event {
-        TransportEvent::New(connection) => {
-            println!("New connection: {}", connection);
-        }
-        TransportEvent::Incoming(msg, connection, source) => {
-            println!("Received message from {}: {}", source, msg);
-        }
-        TransportEvent::Closed(connection) => {
-            println!("Connection closed: {}", connection);
+tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        match event {
+            TransportEvent::New(connection) => println!("New connection: {}", connection),
+            TransportEvent::Incoming(msg, connection, source) => {
+                println!("Received message from {}: {}", source, msg);
+                // Use `connection` to reply if needed
+            }
+            TransportEvent::Closed(connection) => {
+                println!("Connection closed: {}", connection);
+            }
         }
     }
-}
+});
+
+// Start accepting connections (this is normally driven by `Endpoint::serve`)
+transport_layer
+    .serve_listens()
+    .await
+    .expect("failed to start listeners");
 ```
+
+To add TLS or WebSocket listeners, construct a `TlsListenerConnection` or
+`WebSocketListenerConnection` and register it with `transport_layer.add_transport(...)`.
 
 ### 3. Using Endpoint and Transactions
 
@@ -156,11 +167,21 @@ let cancel_token = CancellationToken::new();
 let transport_layer = TransportLayer::new(cancel_token.clone());
 let endpoint = EndpointBuilder::new()
     .with_transport_layer(transport_layer)
-    .with_cancel_token(cancel_token)
+    .with_cancel_token(cancel_token.clone())
     .build();
 
+// Start endpoint background task
+let endpoint_inner = endpoint.inner.clone();
+tokio::spawn(async move {
+    if let Err(err) = endpoint_inner.serve().await {
+        eprintln!("endpoint stopped: {err}");
+    }
+});
+
 // Handle incoming transactions
-let mut incoming = endpoint.incoming_transactions();
+let mut incoming = endpoint
+    .incoming_transactions()
+    .expect("transaction receiver available");
 while let Some(transaction) = incoming.recv().await {
     // Process transaction based on method
     match transaction.original.method {

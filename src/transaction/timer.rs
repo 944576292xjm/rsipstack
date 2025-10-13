@@ -47,21 +47,21 @@ impl<T> Timer<T> {
         self.tasks
             .write()
             .as_mut()
-            .and_then(|ts| {
-                Ok(ts.insert(
+            .map(|ts| {
+                ts.insert(
                     TimerKey {
                         task_id,
                         execute_at,
                     },
                     value,
-                ))
+                )
             })
             .ok();
 
         self.id_to_tasks
             .write()
             .as_mut()
-            .and_then(|it| Ok(it.insert(task_id, execute_at)))
+            .map(|it| it.insert(task_id, execute_at))
             .ok();
         task_id
     }
@@ -110,12 +110,12 @@ impl<T> Timer<T> {
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
 
-            if keys_to_remove.len() == 0 {
+            if keys_to_remove.is_empty() {
                 return result;
             }
             result.reserve(keys_to_remove.len());
             for key in keys_to_remove.iter() {
-                tasks.remove(&key).map(|value| result.push(value));
+                tasks.remove(key).map(|value| result.push(value));
             }
             keys_to_remove
         };
@@ -123,11 +123,10 @@ impl<T> Timer<T> {
             self.id_to_tasks
                 .write()
                 .as_mut()
-                .and_then(|it| {
+                .map(|it| {
                     for key in keys_to_remove {
                         it.remove(&key.task_id);
                     }
-                    Ok(())
                 })
                 .ok();
         }

@@ -8,7 +8,7 @@ use super::{
 use crate::{
     dialog::DialogId,
     transport::{SipAddr, TransportEvent, TransportLayer},
-    Error, Result, USER_AGENT,
+    Error, Result, VERSION,
 };
 use rsip::{prelude::HeadersExt, SipMessage};
 use std::{
@@ -32,7 +32,7 @@ pub struct EndpointOption {
     pub t1: Duration,
     pub t4: Duration,
     pub t1x64: Duration,
-    pub timerb: Duration,
+    pub timerc: Duration,
     pub ignore_out_of_dialog_option: bool,
     pub callid_suffix: Option<String>,
     pub dialog_keepalive_duration: Option<Duration>,
@@ -44,7 +44,7 @@ impl Default for EndpointOption {
             t1: Duration::from_millis(500),
             t4: Duration::from_secs(4),
             t1x64: Duration::from_millis(64 * 500),
-            timerb: Duration::from_secs(64),
+            timerc: Duration::from_secs(180),
             ignore_out_of_dialog_option: true,
             callid_suffix: None,
             dialog_keepalive_duration: Some(Duration::from_secs(60)),
@@ -348,7 +348,7 @@ impl EndpointInner {
                     .read()
                     .unwrap()
                     .get(&key)
-                    .map(|m| m.clone())
+                    .cloned()
                     .flatten();
 
                 if let Some(last_message) = last_message {
@@ -362,21 +362,27 @@ impl EndpointInner {
                     .read()
                     .unwrap()
                     .get(&key)
-                    .map(|m| m.clone())
+                    .cloned()
                     .flatten();
 
                 if let Some(mut last_message) = last_message {
                     match last_message {
                         SipMessage::Request(ref mut last_req) => {
                             if last_req.method() == &rsip::Method::Ack {
-                                if resp.status_code.kind() == rsip::StatusCodeKind::Provisional {
-                                    return Ok(());
-                                }
-                                match resp.to_header()?.tag() {
-                                    Ok(Some(tag)) => {
-                                        last_req.to_header_mut().and_then(|h| h.mut_tag(tag)).ok();
+                                match resp.status_code.kind() {
+                                    rsip::StatusCodeKind::Provisional => {
+                                        return Ok(());
+                                    }
+                                    rsip::StatusCodeKind::Successful => {
+                                        if last_req.to_header()?.tag().ok().is_none() {
+                                            // don't ack 2xx response when ack is placeholder
+                                            return Ok(());
+                                        }
                                     }
                                     _ => {}
+                                }
+                                if let Ok(Some(tag)) = resp.to_header()?.tag() {
+                                    last_req.to_header_mut().and_then(|h| h.mut_tag(tag)).ok();
                                 }
                             }
                         }
@@ -393,13 +399,11 @@ impl EndpointInner {
         } else {
             msg
         };
-        match self.transactions.read().unwrap().get(&key) {
-            Some(tu) => {
-                tu.send(TransactionEvent::Received(msg, Some(connection)))
-                    .map_err(|e| Error::TransactionError(e.to_string(), key))?;
-                return Ok(());
-            }
-            None => {}
+
+        if let Some(tu) = self.transactions.read().unwrap().get(&key) {
+            tu.send(TransactionEvent::Received(msg, Some(connection)))
+                .map_err(|e| Error::TransactionError(e.to_string(), key))?;
+            return Ok(());
         }
         // if the transaction is not exist, create a new transaction
         let request = match msg {
@@ -435,7 +439,7 @@ impl EndpointInner {
             Transaction::new_server(key.clone(), request.clone(), self.clone(), Some(connection));
 
         self.incoming_sender.send(tx).ok();
-        return Ok(());
+        Ok(())
     }
 
     pub fn attach_transaction(&self, key: &TransactionKey, tu_sender: TransactionEventSender) {
@@ -482,7 +486,7 @@ impl EndpointInner {
             .cloned()?;
         let rr = rsip::UriWithParamsList(vec![rsip::UriWithParams {
             uri: first_addr.into(),
-            params: vec![rsip::Param::Other("lr".into(), None)].into(),
+            params: vec![rsip::Param::Other("lr".into(), None)],
         }]);
         Ok(rr.into())
     }
@@ -507,10 +511,9 @@ impl EndpointInner {
             transport: first_addr.r#type.unwrap_or_default(),
             uri: first_addr.addr.into(),
             params: vec![
-                branch.unwrap_or_else(|| make_via_branch()),
+                branch.unwrap_or_else(make_via_branch),
                 rsip::Param::Other("rport".into(), None),
-            ]
-            .into(),
+            ],
         };
         Ok(via)
     }
@@ -544,7 +547,7 @@ impl EndpointBuilder {
     pub fn new() -> Self {
         EndpointBuilder {
             allows: Vec::new(),
-            user_agent: USER_AGENT.to_string(),
+            user_agent: VERSION.to_string(),
             transport_layer: None,
             cancel_token: None,
             timer_interval: None,

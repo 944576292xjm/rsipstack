@@ -39,7 +39,7 @@ impl TcpConnection {
 
         let connection = TcpConnection {
             inner: Arc::new(StreamConnectionInner::new(
-                local_addr,
+                local_addr.clone(),
                 remote.clone(),
                 read_half,
                 write_half,
@@ -49,8 +49,7 @@ impl TcpConnection {
 
         info!(
             "Created TCP client connection: {} -> {}",
-            connection.get_addr(),
-            remote
+            local_addr, remote
         );
 
         Ok(connection)
@@ -81,8 +80,7 @@ impl TcpConnection {
 
         info!(
             "Created TCP server connection: {} <- {}",
-            connection.get_addr(),
-            remote_addr
+            connection.inner.local_addr, remote_addr
         );
 
         Ok(connection)
@@ -96,7 +94,7 @@ impl TcpConnection {
 #[async_trait::async_trait]
 impl StreamConnection for TcpConnection {
     fn get_addr(&self) -> &SipAddr {
-        &self.inner.local_addr
+        &self.inner.remote_addr
     }
 
     async fn send_message(&self, msg: SipMessage) -> Result<()> {

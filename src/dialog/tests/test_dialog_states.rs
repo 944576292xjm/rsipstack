@@ -147,9 +147,12 @@ async fn test_dialog_state_transitions() -> crate::Result<()> {
     assert!(matches!(state, DialogState::Early(_, _)));
 
     // Test transition to Confirmed
-    dialog_inner.transition(DialogState::Confirmed(dialog_id.clone()))?;
+    dialog_inner.transition(DialogState::Confirmed(
+        dialog_id.clone(),
+        Response::default(),
+    ))?;
     let state = dialog_inner.state.lock().unwrap().clone();
-    assert!(matches!(state, DialogState::Confirmed(_)));
+    assert!(matches!(state, DialogState::Confirmed(_, _)));
     assert!(dialog_inner.is_confirmed());
 
     // Test transition to Terminated
@@ -207,14 +210,14 @@ async fn test_server_dialog_state_transitions() -> crate::Result<()> {
         "bob-tag-789",
         "test-call-id-server-123",
     );
-    dialog_inner.transition(DialogState::WaitAck(dialog_id.clone(), ok_resp))?;
+    dialog_inner.transition(DialogState::WaitAck(dialog_id.clone(), ok_resp.clone()))?;
     let state = dialog_inner.state.lock().unwrap().clone();
     assert!(matches!(state, DialogState::WaitAck(_, _)));
 
     // Test transition to Confirmed (after receiving ACK)
-    dialog_inner.transition(DialogState::Confirmed(dialog_id.clone()))?;
+    dialog_inner.transition(DialogState::Confirmed(dialog_id.clone(), ok_resp))?;
     let state = dialog_inner.state.lock().unwrap().clone();
-    assert!(matches!(state, DialogState::Confirmed(_)));
+    assert!(matches!(state, DialogState::Confirmed(_, _)));
     assert!(dialog_inner.is_confirmed());
 
     Ok(())
@@ -250,7 +253,10 @@ async fn test_dialog_in_dialog_requests() -> crate::Result<()> {
     )?;
 
     // Set dialog to confirmed state
-    dialog_inner.transition(DialogState::Confirmed(dialog_id.clone()))?;
+    dialog_inner.transition(DialogState::Confirmed(
+        dialog_id.clone(),
+        Response::default(),
+    ))?;
     assert!(dialog_inner.is_confirmed());
 
     // Test INFO request in dialog
@@ -369,7 +375,10 @@ async fn test_dialog_termination_scenarios() -> crate::Result<()> {
     )?;
 
     // First confirm the dialog
-    dialog_inner_2.transition(DialogState::Confirmed(dialog_id_2.clone()))?;
+    dialog_inner_2.transition(DialogState::Confirmed(
+        dialog_id_2.clone(),
+        Response::default(),
+    ))?;
     assert!(dialog_inner_2.is_confirmed());
 
     // Then terminate normally
@@ -435,7 +444,7 @@ async fn test_dialog_state_display() -> crate::Result<()> {
     let trying_state = DialogState::Trying(dialog_id.clone());
     assert!(trying_state.to_string().contains("Trying"));
 
-    let confirmed_state = DialogState::Confirmed(dialog_id.clone());
+    let confirmed_state = DialogState::Confirmed(dialog_id.clone(), Response::default());
     assert!(confirmed_state.to_string().contains("Confirmed"));
     assert!(confirmed_state.is_confirmed());
 

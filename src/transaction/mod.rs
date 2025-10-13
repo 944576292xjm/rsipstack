@@ -249,6 +249,7 @@ impl std::fmt::Display for TransactionType {
 pub enum TransactionTimer {
     TimerA(TransactionKey, Duration),
     TimerB(TransactionKey),
+    TimerC(TransactionKey),
     TimerD(TransactionKey),
     TimerK(TransactionKey),
     TimerG(TransactionKey, Duration),
@@ -260,6 +261,7 @@ impl TransactionTimer {
         match self {
             TransactionTimer::TimerA(key, _) => key,
             TransactionTimer::TimerB(key) => key,
+            TransactionTimer::TimerC(key) => key,
             TransactionTimer::TimerD(key) => key,
             TransactionTimer::TimerG(key, _) => key,
             TransactionTimer::TimerK(key) => key,
@@ -275,6 +277,7 @@ impl std::fmt::Display for TransactionTimer {
                 write!(f, "TimerA: {} {}", key, duration.as_millis())
             }
             TransactionTimer::TimerB(key) => write!(f, "TimerB: {}", key),
+            TransactionTimer::TimerC(key) => write!(f, "TimerC: {}", key),
             TransactionTimer::TimerD(key) => write!(f, "TimerD: {}", key),
             TransactionTimer::TimerG(key, duration) => {
                 write!(f, "TimerG: {} {}", key, duration.as_millis())

@@ -160,6 +160,7 @@ impl DialogLayer {
                     return Err(crate::Error::DialogError(
                         "the dialog not found".to_string(),
                         id,
+                        rsip::StatusCode::CallTransactionDoesNotExist,
                     ));
                 }
             }

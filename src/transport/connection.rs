@@ -314,6 +314,16 @@ impl SipConnection {
         let received = addr.into();
         let mut typed_via = via.typed()?;
 
+        typed_via.params.retain(|param| {
+            if let Param::Other(key, _) = param {
+                !key.value().eq_ignore_ascii_case("rport")
+            } else if matches!(param, Param::Received(_)) {
+                false
+            } else {
+                true
+            }
+        });
+
         // Only add received parameter if the source address differs from Via header
         if typed_via.uri.host_with_port == received {
             return Ok(());
@@ -331,17 +341,6 @@ impl SipConnection {
         if !should_add_received {
             return Ok(());
         }
-
-        // Remove existing rport parameter
-        typed_via.params.retain(|param| {
-            if let Param::Other(key, _) = param {
-                !key.value().eq_ignore_ascii_case("rport")
-            } else if let Param::Transport(_) = param {
-                false
-            } else {
-                true
-            }
-        });
 
         if transport != rsip::transport::Transport::Udp && typed_via.transport != transport {
             typed_via.params.push(Param::Transport(transport));
@@ -465,14 +464,15 @@ impl From<WebSocketListenerConnection> for SipConnection {
     }
 }
 
-impl Into<rsip::HostWithPort> for SipAddr {
-    fn into(self) -> rsip::HostWithPort {
-        self.addr
+impl From<SipAddr> for rsip::HostWithPort {
+    fn from(val: SipAddr) -> Self {
+        val.addr
     }
 }
-impl Into<rsip::Uri> for SipAddr {
-    fn into(self) -> rsip::Uri {
-        let scheme = match self.r#type {
+
+impl From<SipAddr> for rsip::Uri {
+    fn from(val: SipAddr) -> Self {
+        let scheme = match val.r#type {
             Some(rsip::transport::Transport::Wss) | Some(rsip::transport::Transport::Tls) => {
                 rsip::Scheme::Sips
             }
@@ -480,7 +480,7 @@ impl Into<rsip::Uri> for SipAddr {
         };
         rsip::Uri {
             scheme: Some(scheme),
-            host_with_port: self.addr,
+            host_with_port: val.addr,
             ..Default::default()
         }
     }

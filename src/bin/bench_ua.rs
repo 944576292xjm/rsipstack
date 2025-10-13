@@ -275,7 +275,7 @@ async fn process_dialog_state(
                 },
                 None => {}
             },
-            DialogState::Confirmed(id) => {
+            DialogState::Confirmed(id, _) => {
                 stats
                     .active_calls
                     .lock()
@@ -284,14 +284,12 @@ async fn process_dialog_state(
             }
             DialogState::Terminated(id, status) => {
                 match status {
-                    TerminatedReason::UacOther(Some(status)) => {
+                    TerminatedReason::UacOther(status) => {
                         info!("dialog terminated with status: {}", status);
                     }
-                    TerminatedReason::UasOther(Some(status)) => {
+                    TerminatedReason::UasOther(status) => {
                         info!("dialog terminated with status: {}", status);
                     }
-                    TerminatedReason::UacOther(None) => {}
-                    TerminatedReason::UasOther(None) => {}
                     _ => {}
                 }
                 dialog_layer.remove_dialog(&id);

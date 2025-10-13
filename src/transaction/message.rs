@@ -1,9 +1,8 @@
-use crate::{rsip_ext::extract_uri_from_contact, transaction::make_via_branch};
-
 use super::{endpoint::EndpointInner, make_call_id};
+use crate::{rsip_ext::extract_uri_from_contact, transaction::make_via_branch, Result};
 use rsip::{
     header,
-    headers::Route,
+    headers::{ContentLength, Route},
     prelude::{HeadersExt, ToTypedHeader, UntypedHeader},
     Error, Header, Request, Response, StatusCode,
 };
@@ -227,10 +226,12 @@ impl EndpointInner {
                     | Header::CallId(_)
                     | Header::From(_)
                     | Header::To(_)
-                    | Header::MaxForwards(_)
                     | Header::CSeq(_)
             )
         });
+        headers.push(Header::ContentLength(
+            body.as_ref().map_or(0u32, |b| b.len() as u32).into(),
+        ));
         headers.unique_push(Header::UserAgent(self.user_agent.clone().into()));
         Response {
             status_code,
@@ -240,7 +241,7 @@ impl EndpointInner {
         }
     }
 
-    pub fn make_ack(&self, mut uri: rsip::Uri, resp: &Response) -> crate::Result<Request> {
+    pub fn make_ack(&self, mut uri: rsip::Uri, resp: &Response) -> Result<Request> {
         let mut headers = resp.headers.clone();
         // Check if response to INVITE
         let mut resp_to_invite = false;
@@ -290,7 +291,6 @@ impl EndpointInner {
                     route_set.push(Header::Route(Route::from(record_route.value())));
                 }
             }
-
             route_set.reverse();
             headers.extend(route_set);
         }
@@ -312,6 +312,7 @@ impl EndpointInner {
                 cseq.mut_method(rsip::Method::Ack).ok();
             }
         });
+        headers.push(Header::ContentLength(ContentLength::default())); // 0 because of vec![] below
         headers.unique_push(Header::UserAgent(self.user_agent.clone().into()));
         Ok(rsip::Request {
             method: rsip::Method::Ack,

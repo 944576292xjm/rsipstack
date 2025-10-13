@@ -5,13 +5,14 @@ use super::{
     DialogId,
 };
 use crate::{
-    rsip_ext::extract_uri_from_contact,
+    rsip_ext::{destination_from_request, extract_uri_from_contact},
     transaction::{
         endpoint::EndpointInnerRef,
         key::{TransactionKey, TransactionRole},
         make_via_branch,
         transaction::{Transaction, TransactionEventSender},
     },
+    transport::SipAddr,
     Result,
 };
 use rsip::{
@@ -61,7 +62,7 @@ use tracing::{debug, info, warn};
 /// #     from_tag: "from-tag".to_string(),
 /// #     to_tag: "to-tag".to_string(),
 /// # };
-/// let state = DialogState::Confirmed(dialog_id);
+/// let state = DialogState::Confirmed(dialog_id, rsip::Response::default());
 /// if state.is_confirmed() {
 ///     println!("Dialog is established");
 /// }
@@ -73,7 +74,7 @@ pub enum DialogState {
     Trying(DialogId),
     Early(DialogId, rsip::Response),
     WaitAck(DialogId, rsip::Response),
-    Confirmed(DialogId),
+    Confirmed(DialogId, rsip::Response),
     Updated(DialogId, rsip::Request),
     Notify(DialogId, rsip::Request),
     Info(DialogId, rsip::Request),
@@ -92,8 +93,8 @@ pub enum TerminatedReason {
     UasDecline,
     ProxyError(rsip::StatusCode),
     ProxyAuthRequired,
-    UacOther(Option<rsip::StatusCode>),
-    UasOther(Option<rsip::StatusCode>),
+    UacOther(rsip::StatusCode),
+    UasOther(rsip::StatusCode),
 }
 
 /// SIP Dialog
@@ -174,8 +175,8 @@ pub struct DialogInner {
     pub remote_seq: AtomicU32,
     pub remote_uri: Mutex<rsip::Uri>,
 
-    pub from: String,
-    pub to: Mutex<String>,
+    pub from: rsip::typed::From,
+    pub to: Mutex<rsip::typed::To>,
 
     pub credential: Option<Credential>,
     pub route_set: Mutex<Vec<Route>>,
@@ -183,6 +184,7 @@ pub struct DialogInner {
     pub(super) state_sender: DialogStateSender,
     pub(super) tu_sender: TransactionEventSender,
     pub(super) initial_request: Request,
+    pub(super) initial_destination: Option<SipAddr>,
 }
 
 pub type DialogStateReceiver = UnboundedReceiver<DialogState>;
@@ -198,7 +200,7 @@ impl DialogState {
         )
     }
     pub fn is_confirmed(&self) -> bool {
-        matches!(self, DialogState::Confirmed(_))
+        matches!(self, DialogState::Confirmed(_, _))
     }
     pub fn is_terminated(&self) -> bool {
         matches!(self, DialogState::Terminated(_, _))
@@ -231,11 +233,6 @@ impl DialogInner {
             to.params.push(rsip::Param::Tag(id.to_tag.clone().into()));
         }
 
-        let (from, to) = match role {
-            TransactionRole::Client => (from.to_string(), to.to_string()),
-            TransactionRole::Server => (to.to_string(), from.to_string()),
-        };
-
         let mut route_set = vec![];
         for h in initial_request.headers.iter() {
             if let Header::RecordRoute(rr) = h {
@@ -247,7 +244,7 @@ impl DialogInner {
             role,
             cancel_token: CancellationToken::new(),
             id: Mutex::new(id.clone()),
-            from,
+            from: from,
             to: Mutex::new(to),
             local_seq: AtomicU32::new(cseq),
             remote_uri: Mutex::new(remote_uri),
@@ -259,6 +256,7 @@ impl DialogInner {
             tu_sender,
             state: Mutex::new(DialogState::Calling(id)),
             initial_request,
+            initial_destination: None,
             local_contact,
             remote_contact: Mutex::new(None),
         })
@@ -282,9 +280,8 @@ impl DialogInner {
 
     pub fn update_remote_tag(&self, tag: &str) -> Result<()> {
         self.id.lock().unwrap().to_tag = tag.to_string();
-        let to: rsip::headers::untyped::To = self.to.lock().unwrap().clone().into();
-        *self.to.lock().unwrap() = to.typed()?.with_tag(tag.to_string().into()).to_string();
-        info!("updating remote tag to: {}", self.to.lock().unwrap());
+        let mut to = self.to.lock().unwrap();
+        *to = to.clone().with_tag(tag.into());
         Ok(())
     }
 
@@ -328,8 +325,27 @@ impl DialogInner {
         headers.push(Header::CallId(
             self.id.lock().unwrap().call_id.clone().into(),
         ));
-        headers.push(Header::From(self.from.clone().into()));
-        headers.push(Header::To(self.to.lock().unwrap().clone().into()));
+
+        let to = self
+            .to
+            .lock()
+            .unwrap()
+            .clone()
+            .untyped()
+            .value()
+            .to_string();
+
+        let from = self.from.clone().untyped().value().to_string();
+        match self.role {
+            TransactionRole::Client => {
+                headers.push(Header::From(from.into()));
+                headers.push(Header::To(to.into()));
+            }
+            TransactionRole::Server => {
+                headers.push(Header::From(to.into()));
+                headers.push(Header::To(from.into()));
+            }
+        }
         headers.push(Header::CSeq(cseq_header.into()));
         headers.push(Header::UserAgent(
             self.endpoint_inner.user_agent.clone().into(),
@@ -345,9 +361,9 @@ impl DialogInner {
         }
         headers.push(Header::MaxForwards(70.into()));
 
-        body.as_ref().map(|b| {
-            headers.push(Header::ContentLength((b.len() as u32).into()));
-        });
+        headers.push(Header::ContentLength(
+            body.as_ref().map_or(0u32, |b| b.len() as u32).into(),
+        ));
 
         let req = rsip::Request {
             method,
@@ -380,9 +396,6 @@ impl DialogInner {
         body: Option<Vec<u8>>,
     ) -> rsip::Response {
         let mut resp_headers = rsip::Headers::default();
-        self.local_contact
-            .as_ref()
-            .map(|c| resp_headers.push(Contact::from(c.clone()).into()));
 
         for header in request.headers.iter() {
             match header {
@@ -401,12 +414,12 @@ impl DialogInner {
                         }
                     };
 
-                    if status != StatusCode::Trying {
-                        if !to.params.iter().any(|p| matches!(p, Param::Tag(_))) {
-                            to.params.push(rsip::Param::Tag(
-                                self.id.lock().unwrap().to_tag.clone().into(),
-                            ));
-                        }
+                    if status != StatusCode::Trying
+                        && !to.params.iter().any(|p| matches!(p, Param::Tag(_)))
+                    {
+                        to.params.push(rsip::Param::Tag(
+                            self.id.lock().unwrap().to_tag.clone().into(),
+                        ));
                     }
                     resp_headers.push(Header::To(to.into()));
                 }
@@ -430,11 +443,22 @@ impl DialogInner {
             }
         }
 
-        body.as_ref().map(|b| {
-            resp_headers.push(Header::ContentLength((b.len() as u32).into()));
+        resp_headers.retain(|h| {
+            !matches!(
+                h,
+                Header::Contact(_) | Header::ContentLength(_) | Header::UserAgent(_)
+            )
         });
 
-        resp_headers.unique_push(Header::UserAgent(
+        self.local_contact
+            .as_ref()
+            .map(|c| resp_headers.push(Contact::from(c.clone()).into()));
+
+        resp_headers.push(Header::ContentLength(
+            body.as_ref().map_or(0u32, |b| b.len() as u32).into(),
+        ));
+
+        resp_headers.push(Header::UserAgent(
             self.endpoint_inner.user_agent.clone().into(),
         ));
 
@@ -448,21 +472,12 @@ impl DialogInner {
 
     pub(super) async fn do_request(&self, request: Request) -> Result<Option<rsip::Response>> {
         let method = request.method().to_owned();
-        let mut destination = request.route_header().and_then(|r| {
-            r.typed()
-                .ok()
-                .and_then(|r| r.uris().first().map(|u| u.uri.clone()))
-        });
-
-        if destination.is_none() {
-            if let Some(contact) = self.remote_contact.lock().unwrap().as_ref() {
-                destination = contact.uri().ok();
-            }
-        }
+        let destination =
+            destination_from_request(&request).or_else(|| self.initial_destination.clone());
 
         let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
         let mut tx = Transaction::new_client(key, request, self.endpoint_inner.clone(), None);
-        tx.destination = destination.as_ref().map(|d| d.try_into().ok()).flatten();
+        tx.destination = destination;
 
         match tx.send().await {
             Ok(_) => {
@@ -568,7 +583,7 @@ impl DialogInner {
             }
             _ => {}
         }
-        info!("transitioning state: {} -> {}", old_state, state);
+        debug!("transitioning state: {} -> {}", old_state, state);
         *old_state = state;
         Ok(())
     }
@@ -636,7 +651,7 @@ impl std::fmt::Display for DialogState {
             DialogState::Trying(id) => write!(f, "{}(Trying)", id),
             DialogState::Early(id, _) => write!(f, "{}(Early)", id),
             DialogState::WaitAck(id, _) => write!(f, "{}(WaitAck)", id),
-            DialogState::Confirmed(id) => write!(f, "{}(Confirmed)", id),
+            DialogState::Confirmed(id, _) => write!(f, "{}(Confirmed)", id),
             DialogState::Updated(id, _) => write!(f, "{}(Updated)", id),
             DialogState::Notify(id, _) => write!(f, "{}(Notify)", id),
             DialogState::Info(id, _) => write!(f, "{}(Info)", id),
@@ -654,14 +669,14 @@ impl Dialog {
         }
     }
 
-    pub fn from(&self) -> &str {
+    pub fn from(&self) -> &rsip::typed::From {
         match self {
             Dialog::ServerInvite(d) => &d.inner.from,
             Dialog::ClientInvite(d) => &d.inner.from,
         }
     }
 
-    pub fn to(&self) -> String {
+    pub fn to(&self) -> rsip::typed::To {
         match self {
             Dialog::ServerInvite(d) => d.inner.to.lock().unwrap().clone(),
             Dialog::ClientInvite(d) => d.inner.to.lock().unwrap().clone(),
@@ -709,6 +724,13 @@ impl Dialog {
         match self {
             Dialog::ServerInvite(d) => d.bye().await,
             Dialog::ClientInvite(d) => d.hangup().await,
+        }
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        match self {
+            Dialog::ServerInvite(d) => d.inner.can_cancel(),
+            Dialog::ClientInvite(d) => d.inner.can_cancel(),
         }
     }
 }

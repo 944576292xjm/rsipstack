@@ -17,6 +17,7 @@ use rsipstack::{
 use std::net::IpAddr;
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::timeout;
 use tokio::{select, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -25,6 +26,7 @@ use crate::play_file::play_echo;
 mod play_file;
 #[derive(Debug, Clone)]
 struct MediaSessionOption {
+    pub random_reject: u32,
     pub auto_answer: bool,
     pub cancel_token: CancellationToken,
     pub external_ip: Option<String>,
@@ -41,7 +43,7 @@ struct Args {
     port: u16,
 
     /// SIP port
-    #[arg(long, default_value = "12000")]
+    #[arg(long, default_value = "32000")]
     rtp_start_port: u16,
 
     #[arg(long, default_value = "false")]
@@ -71,6 +73,8 @@ struct Args {
 
     #[arg(long)]
     auto_answer: bool,
+    #[arg(long, default_value = "0")]
+    random_reject: u32,
 }
 
 async fn handle_user_input(
@@ -169,6 +173,7 @@ async fn main() -> rsipstack::Result<()> {
         rtp_start_port: args.rtp_start_port,
         echo: args.echo,
         auto_answer: args.auto_answer,
+        random_reject: args.random_reject,
     };
 
     let transport_layer = TransportLayer::new(token.clone());
@@ -244,12 +249,9 @@ async fn main() -> rsipstack::Result<()> {
                 let invite_option = InviteOption {
                     callee: callee.try_into().expect("callee"),
                     caller: contact.clone(),
-                    content_type: None,
-                    offer: None,
                     contact: contact.clone(),
                     credential: Some(credential.clone()),
-                    headers: None,
-                    destination: None,
+                    ..Default::default()
                 };
 
                 match make_call(dialog_layer, invite_option, opt, state_sender).await {
@@ -381,7 +383,8 @@ async fn process_dialog(
                         // play example pcmu of handling incoming call
                         //
                         // [A] Ai answer, [R] Reject, [E] Play example pcmu
-                        process_invite(&opt, d).await?;
+                        let opt_clone = opt.clone();
+                        tokio::spawn(async move { process_invite(&opt_clone, d).await.ok() });
                     }
                     Dialog::ClientInvite(_) => {
                         info!("Client invite dialog {}", id);
@@ -510,11 +513,39 @@ async fn process_invite(opt: &MediaSessionOption, dialog: ServerInviteDialog) ->
     let (conn, answer) = build_rtp_conn(opt, ssrc, payload_type).await?;
 
     let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
+    if opt.random_reject > 0 {
+        if rand::random::<u32>() % opt.random_reject == 0 {
+            info!("Randomly rejecting the call");
+            dialog
+                .reject(Some(rsip::StatusCode::BusyHere), Some("Busy here".into()))
+                .ok();
+            return Ok(());
+        }
+    }
+    let mut ts = 0;
+    let mut seq = 1;
+    let peer_addr = format!("{}:{}", peer_addr, peer_port);
     if opt.auto_answer {
         let headers = vec![rsip::typed::ContentType(MediaType::Sdp(vec![])).into()];
-        dialog.accept(Some(headers), Some(answer.clone().into()))?;
-        answer_sender.send("a".to_string()).expect("send answer");
+        dialog.ringing(Some(headers), Some(answer.clone().into()))?;
+        let ringback_token = CancellationToken::new();
+        timeout(
+            Duration::from_secs(rand::random::<u64>() % 3u64 + 1),
+            play_audio_file(
+                conn.clone(),
+                ringback_token.clone(),
+                ssrc,
+                "ringback",
+                ts,
+                seq,
+                peer_addr.clone(),
+                payload_type,
+            ),
+        )
+        .await
+        .ok();
 
+        //answer_sender.send("a".to_string()).expect("send answer");
         info!(
             "Accepted call with answer SDP peer address: {} port: {} payload_type: {}",
             peer_addr, peer_port, payload_type
@@ -524,7 +555,6 @@ async fn process_invite(opt: &MediaSessionOption, dialog: ServerInviteDialog) ->
         dialog.ringing(Some(headers), Some(answer.clone().into()))?;
     }
 
-    let peer_addr = format!("{}:{}", peer_addr, peer_port);
     let rtp_token = dialog.cancel_token().child_token();
     let echo = opt.echo;
     let answered = opt.auto_answer;
@@ -536,8 +566,6 @@ async fn process_invite(opt: &MediaSessionOption, dialog: ServerInviteDialog) ->
                 info!("user input handler finished");
             }
             _ = async {
-                let mut ts = 0;
-                let mut seq = 1;
                 let mut rejected = false;
 
                 println!("\x1b[32mPress 'a' to answer, 'r' to reject, or 'q' to quit.\x1b[0m");
@@ -562,7 +590,7 @@ async fn process_invite(opt: &MediaSessionOption, dialog: ServerInviteDialog) ->
                                 info!("User answered the call");
                             } else if r == "r" {
                                 info!("User rejected the call");
-                                dialog.reject().ok();
+                                dialog.reject(Some(rsip::StatusCode::BusyHere), Some("Busy here".into())).ok();
                                 rejected = true;
                                 return;
                             } else {

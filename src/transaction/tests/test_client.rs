@@ -2,7 +2,8 @@ use crate::transaction::key::{TransactionKey, TransactionRole};
 use crate::transaction::transaction::Transaction;
 use crate::transport::udp::UdpConnection;
 use crate::{transport::TransportEvent, Result};
-use rsip::{headers::*, SipMessage};
+use rsip::{headers::*, Header, Response, SipMessage, Uri};
+use std::convert::TryFrom;
 use std::time::Duration;
 use tokio::{select, sync::mpsc::unbounded_channel, time::sleep};
 use tracing::info;
@@ -106,5 +107,61 @@ async fn test_client_transaction() -> Result<()> {
             assert!(false, "timeout waiting");
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_make_ack_uses_contact_and_reversed_route_order() -> Result<()> {
+    let endpoint = super::create_test_endpoint(None).await?;
+
+    let raw_response = "SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/TCP uac.example.com:5060;branch=z9hG4bK1\r\n\
+Record-Route: <sip:proxy1.example.com:5060;transport=tcp;lr>\r\n\
+Record-Route: <sip:proxy2.example.com:5070;transport=tcp;lr>\r\n\
+From: <sip:alice@example.com>;tag=from-tag\r\n\
+To: <sip:bob@example.com>;tag=to-tag\r\n\
+Call-ID: callid@example.com\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:uas@192.0.2.55:5080;transport=tcp>\r\n\
+Content-Length: 0\r\n\r\n";
+
+    let response = Response::try_from(raw_response)?;
+
+    let original_uri = Uri::try_from("sip:uas@192.0.2.55")?;
+    let ack = endpoint.inner.make_ack(original_uri, &response)?;
+
+    let expected_uri = Uri::try_from("sip:uas@192.0.2.55:5080;transport=tcp")?;
+    assert_eq!(ack.uri, expected_uri, "ACK must target the remote Contact");
+
+    // Check Content-Length
+    let content_length: String = ack
+        .headers
+        .iter()
+        .filter_map(|header| match header {
+            Header::ContentLength(content_length) => Some(content_length.value().to_string()),
+            _ => None,
+        })
+        .next()
+        .expect("ACK must include a Content-Length header");
+
+    assert_eq!(content_length, "0", "Content-Length of ACK must be 0");
+    let routes: Vec<String> = ack
+        .headers
+        .iter()
+        .filter_map(|header| match header {
+            Header::Route(route) => Some(route.value().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        routes,
+        vec![
+            "<sip:proxy2.example.com:5070;transport=tcp;lr>".to_string(),
+            "<sip:proxy1.example.com:5060;transport=tcp;lr>".to_string()
+        ],
+        "ACK Route headers must follow the reversed Record-Route order"
+    );
+
     Ok(())
 }
