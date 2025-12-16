@@ -1,9 +1,0 @@
-/target
-Cargo.lock
-/pkg
-.env
-.env.*
-*~
-prompt.txt
-/test/web/.next
-/test/web/node_modules
